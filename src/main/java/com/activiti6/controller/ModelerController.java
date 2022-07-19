@@ -1,27 +1,51 @@
 package com.activiti6.controller;
 
+import java.io.ByteArrayInputStream;
+import java.io.File;
+import java.io.FileInputStream;
 import java.io.IOException;
+import java.io.InputStream;
+import java.io.InputStreamReader;
+import java.nio.charset.StandardCharsets;
+import java.util.Arrays;
 import java.util.HashMap;
 import java.util.Map;
 
 import javax.servlet.http.HttpServletResponse;
+import javax.xml.stream.XMLInputFactory;
+import javax.xml.stream.XMLStreamReader;
 
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.sun.xml.internal.fastinfoset.stax.StAXDocumentParser;
+import com.sun.xml.internal.ws.streaming.DOMStreamReader;
+import org.activiti.bpmn.converter.BpmnXMLConverter;
+import org.activiti.bpmn.converter.parser.ImportParser;
 import org.activiti.bpmn.model.BpmnModel;
 import org.activiti.editor.constants.ModelDataJsonConstants;
 import org.activiti.editor.language.json.converter.BpmnJsonConverter;
 import org.activiti.engine.HistoryService;
 import org.activiti.engine.RepositoryService;
 import org.activiti.engine.RuntimeService;
+import org.activiti.engine.impl.bpmn.parser.BpmnParse;
+import org.activiti.engine.impl.bpmn.parser.BpmnParser;
+import org.activiti.engine.impl.util.io.InputStreamSource;
 import org.activiti.engine.repository.Deployment;
 import org.activiti.engine.repository.Model;
+import org.activiti.engine.repository.ProcessDefinition;
 import org.activiti.engine.runtime.ProcessInstance;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.http.HttpEntity;
+import org.springframework.http.HttpHeaders;
+import org.springframework.http.MediaType;
 import org.springframework.stereotype.Controller;
 import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.ResponseBody;
+import org.springframework.web.multipart.MultipartFile;
 import org.springframework.web.servlet.ModelAndView;
 
 import com.fasterxml.jackson.databind.JsonNode;
@@ -142,6 +166,47 @@ public class ModelerController{
 		logger.info("流程部署出参map：{}",map);
         return map;
     }
+
+	@ResponseBody
+	@GetMapping(value = "/download-xml", produces = MediaType.APPLICATION_OCTET_STREAM_VALUE)
+	public HttpEntity<byte[]> downloadXml(String modelId, HttpServletResponse response) throws IOException {
+		byte[] def = repositoryService.getModelEditorSource(modelId);
+		BpmnModel bpmnModel = new BpmnJsonConverter().convertToBpmnModel(new ObjectMapper().readTree(def));
+		byte[] xml = new BpmnXMLConverter().convertToXML(bpmnModel, StandardCharsets.UTF_8.name());
+		response.setHeader("Content-Disposition", "attachment; filename=" + bpmnModel.getMainProcess().getName() + ".bpmn20.xml");
+		return new HttpEntity<>(xml);
+	}
+
+	@PostMapping("/upload-process-def")
+	public void uploadModel(@RequestParam("inputs") MultipartFile[] files, HttpServletResponse response) throws IOException {
+		String modelId = null;
+		for (MultipartFile file : files) {
+			BpmnModel bpmnModel = new BpmnXMLConverter().convertToBpmnModel(new InputStreamSource(file.getInputStream()), false,
+					false);
+
+			String processName = bpmnModel.getMainProcess().getName();
+			if (processName == null || processName.isEmpty()) {
+				processName = bpmnModel.getMainProcess().getId();
+			}
+
+			Model modelData = repositoryService.newModel();
+			ObjectNode modelObjectNode = new ObjectMapper().createObjectNode();
+			modelObjectNode.put(ModelDataJsonConstants.MODEL_NAME, processName);
+			modelObjectNode.put(ModelDataJsonConstants.MODEL_REVISION, 1);
+			modelData.setMetaInfo(modelObjectNode.toString());
+			modelData.setName(processName);
+			modelData.setKey(file.getOriginalFilename());
+
+			repositoryService.saveModel(modelData);
+			BpmnJsonConverter converter = new BpmnJsonConverter();
+			ObjectNode modelNode = converter.convertToJson(bpmnModel);
+
+			repositoryService.addModelEditorSource(modelData.getId(), modelNode.toString().getBytes(StandardCharsets.UTF_8));
+			modelId = modelData.getId();
+		}
+
+		response.sendRedirect("/editor?modelId="+ modelId);
+	}
     
     /**
      * 撤销流程定义
@@ -191,6 +256,7 @@ public class ModelerController{
 				   runtimeService.deleteProcessInstance(pi.getId(), "");
 				   historyService.deleteHistoricProcessInstance(pi.getId());
 			   }
+			   repositoryService.deleteModel(modelId);
 				map.put("code", "SUCCESS");
 			} catch (Exception e) {
 				logger.error("删除流程实例服务异常：{}",e);
